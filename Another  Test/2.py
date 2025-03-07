@@ -67,11 +67,11 @@ tick_size = raw_point
 min_stop_level = symbol_info.trade_stops_level
 
 class Wallet:
-    def __init__(self, max_risk_per_trade=0.2, max_drawdown=0.9, max_consecutive_losses=15):  # FIX 1: Increased to 15
+    def __init__(self, max_risk_per_trade=0.2, max_drawdown=0.9, max_consecutive_losses=15):
         account_info = mt5.account_info()
         self.balance = account_info.balance if account_info else 0
         self.initial_balance = self.balance
-        self.positions = {}
+        self.positions = {}  # Now includes trailing stop info
         self.trade_history = []
         self.max_risk_per_trade = max_risk_per_trade
         self.max_drawdown = max_drawdown
@@ -83,7 +83,7 @@ class Wallet:
         account_info = mt5.account_info()
         if account_info is not None:
             self.balance = account_info.balance
-            drawdown = max(0, (self.initial_balance - self.balance) / self.initial_balance)  # FIX 5: Corrected drawdown
+            drawdown = max(0, (self.initial_balance - self.balance) / self.initial_balance)
             if drawdown >= self.max_drawdown:
                 self.paused = True
                 logging.warning(f"Trading paused: Drawdown {drawdown*100:.2f}% exceeds {self.max_drawdown*100}%")
@@ -91,7 +91,7 @@ class Wallet:
                 self.paused = True
                 logging.warning(f"Trading paused: {self.consecutive_losses} consecutive losses exceed {self.max_consecutive_losses}")
             else:
-                self.paused = False  # Reset pause if conditions improve
+                self.paused = False
         else:
             logging.warning("Failed to sync balance with MT5")
 
@@ -102,20 +102,22 @@ class Wallet:
             side = "Buy" if pos.type == mt5.POSITION_TYPE_BUY else "Sell"
             self.positions[pos.ticket] = {
                 'qty': pos.volume, 'entry_price': pos.price_open, 'side': side,
-                'stop_loss': pos.sl, 'take_profit': pos.tp, 'ticket': pos.ticket
+                'stop_loss': pos.sl, 'take_profit': pos.tp, 'ticket': pos.ticket,
+                'highest_price': pos.price_open, 'lowest_price': pos.price_open,
+                'trailing_stop_percent': random.uniform(1.7, 2.0)  # Default if not set
             }
             logging.info(f"Synced MT5 position: {side} {pos.volume} {symbol} @ {pos.price_open}")
         self.sync_balance()
 
     def calculate_position_size(self, price, stop_loss_distance):
-        leverage = 15  # FIX 4: Increased leverage to 15
+        leverage = 15
         risk_amount = self.balance * self.max_risk_per_trade * leverage
         max_qty = risk_amount / (stop_loss_distance * price)
         qty = min(max_qty, max_volume)
         logging.info(f"Position size scaled: Balance={self.balance}, Qty={qty}")
         return adjust_volume(qty, min_volume, max_volume, volume_step)
 
-    def open_position(self, symbol, side, qty, price, stop_loss, take_profit):
+    def open_position(self, symbol, side, qty, price, trailing_stop_percent):
         if self.paused:
             logging.warning("Trading paused due to drawdown or loss limit.")
             return False
@@ -123,16 +125,37 @@ class Wallet:
         self.sync_balance()
         if self.balance >= cost:
             self.balance -= cost
-            ticket = random.randint(100000, 999999)  # Placeholder
+            ticket = random.randint(100000, 999999)  # Placeholder, will be updated with MT5 ticket
+            initial_stop_loss = price * (1 - trailing_stop_percent / 100) if side == "Buy" else price * (1 + trailing_stop_percent / 100)
             self.positions[ticket] = {
                 'qty': qty, 'entry_price': price, 'side': side,
-                'stop_loss': stop_loss, 'take_profit': take_profit, 'ticket': ticket
+                'stop_loss': initial_stop_loss, 'take_profit': None,
+                'ticket': ticket, 'highest_price': price, 'lowest_price': price,
+                'trailing_stop_percent': trailing_stop_percent
             }
-            logging.info(f"Opened {side} position: {qty} {symbol} @ {price}, SL: {stop_loss}, TP: {take_profit}")
+            logging.info(f"Opened {side} position: {qty} {symbol} @ {price}, Trailing Stop: {trailing_stop_percent}%")
             return True
         else:
             logging.warning(f"Insufficient funds: {cost} > {self.balance}")
             return False
+
+    def update_trailing_stop(self, ticket, current_price):
+        if ticket not in self.positions:
+            return
+        pos = self.positions[ticket]
+        trailing_stop_percent = pos['trailing_stop_percent']
+        if pos['side'] == "Buy":
+            pos['highest_price'] = max(pos['highest_price'], current_price)
+            new_stop_loss = pos['highest_price'] * (1 - trailing_stop_percent / 100)
+            if new_stop_loss > pos['stop_loss']:
+                pos['stop_loss'] = new_stop_loss
+                logging.info(f"Updated Buy trailing SL for ticket {ticket}: {new_stop_loss}")
+        else:  # Sell
+            pos['lowest_price'] = min(pos['lowest_price'], current_price)
+            new_stop_loss = pos['lowest_price'] * (1 + trailing_stop_percent / 100)
+            if new_stop_loss < pos['stop_loss']:
+                pos['stop_loss'] = new_stop_loss
+                logging.info(f"Updated Sell trailing SL for ticket {ticket}: {new_stop_loss}")
 
     def close_position(self, ticket, price):
         if ticket in self.positions and self.positions[ticket]['qty'] > 0:
@@ -572,6 +595,27 @@ def main_loop():
             last_close = current_close
 
             wallet.sync_with_mt5(symbol)
+            current_price = df["close_1m"].iloc[-1]
+
+            # Update trailing stops for all open positions
+            for ticket, pos in list(wallet.positions.items()):
+                wallet.update_trailing_stop(ticket, current_price)
+                new_sl = pos['stop_loss']
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": symbol,
+                    "position": ticket,
+                    "sl": new_sl,
+                    "tp": pos['take_profit'] if pos['take_profit'] else 0,
+                }
+                result = mt5.order_send(request)
+                if result.retcode != mt5.TRADE_RETCODE_DONE:
+                    logging.error(f"Failed to update SL for ticket {ticket}: {result.comment}")
+                # Check if trailing stop is hit
+                if (pos['side'] == "Buy" and current_price <= new_sl) or (pos['side'] == "Sell" and current_price >= new_sl):
+                    wallet.close_position(ticket, current_price)
+                    logging.info(f"Trailing stop hit for ticket {ticket}")
+
             markov_chain.update_transition_matrix(wallet.trade_history)
             current_state, stationary_dist = markov_chain.next_state()
             entropy = markov_chain.entropy()
@@ -618,11 +662,6 @@ def main_loop():
             time.sleep(1)
 
 def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_prob=0.0):
-    # --- FIX 3: Temporary bypass of pause for testing ---
-    # if wallet.paused:
-    #     logging.warning("Trading paused.")
-    #     return
-    
     side = "Buy" if prediction == 1 else "Sell"
     try:
         bid_prices, bid_volumes, ask_prices, ask_volumes = fetch_order_book(symbol, df)
@@ -640,18 +679,11 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             logging.info(f"Confidence too low: RF={rf_confidence:.2f}, DT={dt_confidence:.2f}")
             return
 
-        atr_1m = df["atr_1m"].iloc[-1]
-        stop_loss_distance = min(max(atr_1m * 0.5, min_stop_level * tick_size), current_price * 0.005)
-        take_profit_distance = min(max(atr_1m * 10, min_stop_level * tick_size * 2), current_price * 0.05)
-        stop_loss = round(current_price - stop_loss_distance if side == "Buy" else current_price + stop_loss_distance, 6)
+        # Set trailing stop between 1.7% and 2%
+        trailing_stop_percent = random.uniform(1.7, 2.0)
+        initial_stop_loss = current_price * (1 - trailing_stop_percent / 100) if side == "Buy" else current_price * (1 + trailing_stop_percent / 100)
+        take_profit_distance = min(max(df["atr_1m"].iloc[-1] * 10, min_stop_level * tick_size * 2), current_price * 0.05)
         take_profit = round(current_price + take_profit_distance if side == "Buy" else current_price - take_profit_distance, 6)
-        
-        sl_distance = abs(current_price - stop_loss)
-        tp_distance = abs(current_price - take_profit)
-        min_distance = min_stop_level * tick_size
-        if sl_distance < min_distance or tp_distance < min_distance * 2:
-            logging.warning(f"Invalid stops: SL={stop_loss}, TP={take_profit}, Min Stop={min_distance}")
-            return
 
         hurst_value = hurst_exponent(df["close_1m"].values[-50:])
         if (side == "Buy" and hurst_value > 0.6) or (side == "Sell" and hurst_value < 0.4):
@@ -661,7 +693,7 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
         close_1m = df["close_1m"].iloc[-1]
         ma20_1m = df["ma20_1m"].iloc[-1]
         momentum_1m = df["momentum_1m"].iloc[-1]
-        momentum_threshold = atr_1m * 0.1
+        momentum_threshold = df["atr_1m"].iloc[-1] * 0.1
         if side == "Buy" and close_1m > ma20_1m and momentum_1m >= -momentum_threshold:
             logging.info("Breakout Buy signal confirmed")
         elif side == "Sell" and close_1m < ma20_1m and momentum_1m <= momentum_threshold:
@@ -683,9 +715,18 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             logging.info(f"Volatility too low: {volatility*100:.2f}%")
             return
 
-        imbalance = calculate_bid_ask_imbalance(bid_volumes, ask_volumes)
+        # Determine position size based on win probability
+        stop_loss_distance = current_price * trailing_stop_percent / 100
+        dt_win_prob = dt_confidence * 100  # Convert to percentage
+        high_prob_threshold = 70  # Define "high" as >70% win probability
+        if dt_win_prob >= high_prob_threshold:
+            adjusted_qty = random.uniform(0.15, 0.2)  # 0.15 to 0.2 BTC for high probability
+            adjusted_qty = adjust_volume(adjusted_qty, min_volume, max_volume, volume_step)
+            logging.info(f"High win probability ({dt_win_prob:.2f}%) detected: Setting qty to {adjusted_qty} BTC")
+        else:
+            adjusted_qty = wallet.calculate_position_size(current_price, stop_loss_distance)
+            logging.info(f"Standard win probability ({dt_win_prob:.2f}%): Calculated qty = {adjusted_qty}")
 
-        adjusted_qty = wallet.calculate_position_size(current_price, stop_loss_distance)
         if adjusted_qty < min_volume * 10:
             adjusted_qty = min_volume * 10
             logging.info(f"Forced minimum qty: {adjusted_qty}")
@@ -699,7 +740,6 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             logging.warning(f"Trade cost {cost:.2f} USDT exceeds balance {wallet.balance:.2f} USDT. Skipping.")
             return
 
-        # --- FIX 2: Close opposing positions ---
         if side == "Sell":
             for ticket, pos in list(wallet.positions.items()):
                 if pos['side'] == "Buy":
@@ -716,7 +756,7 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             "volume": adjusted_qty,
             "type": order_type,
             "price": current_price,
-            "sl": stop_loss,
+            "sl": initial_stop_loss,
             "tp": take_profit,
             "deviation": 20,
             "magic": 123456,
@@ -725,21 +765,27 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        logging.info(f"Attempting {side} trade: Price={current_price}, Qty={adjusted_qty}, SL={stop_loss}, TP={take_profit}")
+        logging.info(f"Attempting {side} trade: Price={current_price}, Qty={adjusted_qty}, Initial SL={initial_stop_loss}, TP={take_profit}")
         result = mt5.order_send(request)
         logging.info(f"MT5 Order Result: {result}")
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logging.error(f"Order failed: {result.comment} (retcode: {result.retcode})")
             return
 
-        logging.info(f"Placed {side} order: {adjusted_qty} {symbol} @ {current_price}, SL: {stop_loss}, TP: {take_profit}")
-        wallet.sync_with_mt5(symbol)
-        if side == "Buy":
-            if wallet.open_position(symbol, side, adjusted_qty, current_price, stop_loss, take_profit):
-                logging.info(f"Trade recorded in wallet for {symbol}")
-        elif side == "Sell" and len(wallet.positions) > 0:
-            for ticket in list(wallet.positions.keys()):
-                wallet.close_position(ticket, current_price)
+        # Update wallet with actual MT5 ticket
+        ticket = result.order
+        if wallet.positions:  # If there’s a placeholder, replace it
+            wallet.positions[ticket] = wallet.positions.pop(next(iter(wallet.positions)))
+        else:
+            wallet.positions[ticket] = {}
+        wallet.positions[ticket] = {
+            'qty': adjusted_qty, 'entry_price': current_price, 'side': side,
+            'stop_loss': initial_stop_loss, 'take_profit': take_profit,
+            'ticket': ticket, 'highest_price': current_price, 'lowest_price': current_price,
+            'trailing_stop_percent': trailing_stop_percent
+        }
+
+        logging.info(f"Placed {side} order with {trailing_stop_percent}% trailing stop: {adjusted_qty} {symbol} @ {current_price}")
 
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
