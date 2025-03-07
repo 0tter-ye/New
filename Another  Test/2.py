@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import recall_score, f1_score, confusion_matrix
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import joblib
@@ -163,13 +164,18 @@ class Wallet:
         if trades is None:
             trades = self.trade_history
         self.sync_balance()
-        total_profit = sum(trade['profit'] for trade in trades)
+        total_profit = sum(trade['profit'] for trade in trades if 'profit' in trade)
         total_trades = len(trades)
         final_value = self.initial_balance + total_profit
         total_return = (final_value - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
-        profit_factor = float('inf') if sum(1 for t in trades if t['profit'] <= 0) == 0 else sum(t['profit'] for t in trades if t['profit'] > 0) / abs(sum(t['profit'] for t in trades if t['profit'] <= 0))
-        avg_trade_return = np.mean([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades]) if total_trades > 0 else 0
+        profit_factor = float('inf') if sum(1 for t in trades if t['profit'] <= 0) == 0 else \
+                        sum(t['profit'] for t in trades if t['profit'] > 0) / abs(sum(t['profit'] for t in trades if t['profit'] <= 0))
+        avg_trade_return = np.mean([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades if total_trades > 0]) if total_trades > 0 else 0
         win_rate = len([t for t in trades if t['profit'] > 0]) / total_trades * 100 if total_trades > 0 else 0
+        current_trade_return = (trades[-1]['profit'] / (trades[-1]['qty'] * trades[-1]['entry_price']) * 100) if trades and total_trades > 0 else 0
+        sharp_ratio = np.mean([t['profit'] / (t['qty'] * t['entry_price']) for t in trades]) / np.std([t['profit'] / (t['qty'] * t['entry_price']) for t in trades]) if total_trades > 1 else 0
+        last_trade_z_score = (current_trade_return - avg_trade_return) / np.std([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades]) if total_trades > 1 else 0
+
         return {
             'start_value': self.initial_balance,
             'final_value': final_value,
@@ -178,7 +184,10 @@ class Wallet:
             'avg_trade_return': avg_trade_return,
             'total_trades': total_trades,
             'win_rate': win_rate,
-            'current_balance': self.balance
+            'current_balance': self.balance,
+            'current_trade_return': current_trade_return,
+            'sharp_ratio': sharp_ratio,
+            'last_trade_z_score': last_trade_z_score
         }
 
     def get_periodic_performance(self):
@@ -260,6 +269,18 @@ class MarkovChain:
             self.transition_matrix = np.where(row_sums == 0, 0.5, transitions / row_sums)
             self.stationary_dist = self.compute_stationary_distribution()
             logging.info(f"Updated Markov transition matrix: {self.transition_matrix}")
+
+    def get_markov_analysis(self, trade_history):
+        self.update_transition_matrix(trade_history)
+        current_state, stationary_dist = self.next_state()
+        entropy = self.entropy()
+        markov_win_prob = stationary_dist[1].item() * 100
+        return {
+            'transition_matrix': self.transition_matrix,
+            'stationary_distribution': stationary_dist,
+            'entropy': entropy,
+            'predicted_win_probability': markov_win_prob
+        }
 
 states = ["Loss", "Win"]
 transition_matrix = np.array([[0.6, 0.4], [0.3, 0.7]])
@@ -406,7 +427,7 @@ def adjust_volume(volume, min_vol, max_vol, step):
 def train_models(df):
     if df.empty or not any(col.endswith("_1m") for col in df.columns):
         logging.error("DataFrame is empty or missing required 1m columns")
-        return None, None, None
+        return None, None, None, None
     
     feature_cols = [col for col in df.columns if col not in ["timestamp"] and not col.startswith("turnover")]
     X = df[feature_cols].iloc[:-1]
@@ -432,16 +453,32 @@ def train_models(df):
     dt_model = DecisionTreeClassifier(max_depth=5, random_state=42)
     dt_model.fit(X_train_scaled, y_train)
     dt_accuracy = dt_model.score(X_test_scaled, y_test)
+    dt_recall = recall_score(y_test, dt_model.predict(X_test_scaled), average='binary')
+    dt_f1 = f1_score(y_test, dt_model.predict(X_test_scaled), average='binary')
+    dt_conf_matrix = confusion_matrix(y_test, dt_model.predict(X_test_scaled))
+    dt_max_depth = dt_model.get_depth()
+    dt_leaves = dt_model.get_n_leaves()
+    dt_feature_importances = dt_model.feature_importances_
+    dt_pred_prob = dt_model.predict_proba(scaler.transform(df[feature_cols].iloc[-1].values.reshape(1, -1)))[0][1] * 100
 
     logging.info(f"RF Model Accuracy: {rf_accuracy:.2f}")
-    logging.info(f"DT Model Accuracy: {dt_accuracy:.2f}, Max Depth: {dt_model.get_depth()}, Leaves: {dt_model.get_n_leaves()}")
-    return rf_model, dt_model, scaler
+    logging.info(f"DT Model Accuracy: {dt_accuracy:.2f}, Recall: {dt_recall:.2f}, F1: {dt_f1:.2f}")
+    return rf_model, dt_model, scaler, {
+        'accuracy': dt_accuracy,
+        'recall': dt_recall,
+        'f1_score': dt_f1,
+        'confusion_matrix': dt_conf_matrix,
+        'max_depth': dt_max_depth,
+        'leaves': dt_leaves,
+        'feature_importances': dt_feature_importances,
+        'predicted_win_probability': dt_pred_prob
+    }
 
 df_initial = fetch_combined_data(symbol, timeframes=["1"], limit=500)
 if df_initial.empty:
     logging.error("Initial data fetch failed. Exiting.")
     exit()
-rf_model, dt_model, scaler = train_models(df_initial)
+rf_model, dt_model, scaler, dt_analysis = train_models(df_initial)
 if rf_model is None or dt_model is None or scaler is None:
     logging.error("Model training failed. Exiting.")
     exit()
@@ -464,6 +501,35 @@ def backtest_strategy(df, initial_balance=50000):
     logging.info(f"Backtest Result: Final Balance={summary['final_value']:.2f}, Return={summary['total_return']:.2f}%")
     return summary
 
+def display_results(wallet, markov_chain, dt_analysis):
+    summary = wallet.get_performance_summary()
+    markov_analysis = markov_chain.get_markov_analysis(wallet.trade_history)
+    
+    print("=== Current Fund Performance (13th Nov 24 - Present) ===")
+    print(f"Start Value: £{summary['start_value']:,}")
+    print(f"Final Value: £{summary['final_value']:,}")
+    print(f"Total Return (Multiplier): {summary['total_return'] / 100:.2f}x")
+    print(f"Profit Factor: {summary['profit_factor']}")
+    print(f"Average Trade Return: {summary['avg_trade_return']:.2f}%")
+    print(f"Return Std Dev: {np.std([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in wallet.trade_history]):.2f}")
+    print(f"Sharpe Ratio: {summary['sharp_ratio']:.2f}")
+    print(f"Last Trade Z-Score: {summary['last_trade_z_score']:.2f}")
+    print(f"Current Trade Return: {summary['current_trade_return']:.2f}%")
+    print("\n--- Current Fund Markov Chain Analysis ---")
+    print(f"Transition Matrix (Rows: [0=Loss, 1=Win]): {markov_analysis['transition_matrix']}")
+    print(f"Stationary Distribution (Loss, Win): {markov_analysis['stationary_distribution']}")
+    print(f"Markov Chain Entropy: {markov_analysis['entropy']:.2f} bits")
+    print(f"Predicted Next Trade Win Probability (Markov): {markov_analysis['predicted_win_probability']:.2f}%")
+    print("\n--- Current Fund Decision Tree Analysis ---")
+    print(f"Decision Tree Accuracy: {dt_analysis['accuracy']:.2f}")
+    print(f"Decision Tree Recall: {dt_analysis['recall']:.2f}")
+    print(f"Decision Tree F1 Score: {dt_analysis['f1_score']:.2f}")
+    print(f"Decision Tree Confusion Matrix: {dt_analysis['confusion_matrix']}")
+    print(f"Decision Tree Max Depth: {dt_analysis['max_depth']}")
+    print(f"Decision Tree Number of Leaves: {dt_analysis['leaves']}")
+    print(f"Decision Tree Feature Importances: {dt_analysis['feature_importances']}")
+    print(f"Predicted Next Trade Win Probability (Decision Tree): {dt_analysis['predicted_win_probability']:.2f}%")
+
 def main_loop():
     iteration = 0
     start_time = datetime.now()
@@ -474,7 +540,7 @@ def main_loop():
     cooldown = 0
     last_close = None
 
-    global rf_model, dt_model, scaler
+    global rf_model, dt_model, scaler, dt_analysis
 
     logging.info("Initial delay of 10 seconds to avoid API rate limits...")
     time.sleep(10)
@@ -496,11 +562,11 @@ def main_loop():
             current_time = datetime.now()
             current_close = df["close_1m"].iloc[-1]
             if last_close and abs(current_close - last_close) / last_close > 0.02:
-                rf_model, dt_model, scaler = train_models(df)
+                rf_model, dt_model, scaler, dt_analysis = train_models(df)
                 last_retrain_time = current_time
                 logging.info("Models retrained due to significant price move")
             elif current_time - last_retrain_time >= retrain_interval:
-                rf_model, dt_model, scaler = train_models(df)
+                rf_model, dt_model, scaler, dt_analysis = train_models(df)
                 last_retrain_time = current_time
                 logging.info("Models retrained.")
             last_close = current_close
@@ -531,20 +597,11 @@ def main_loop():
             logging.info(f"Temporary Summary: Balance: {summary['current_balance']:.2f}, Trades: {summary['total_trades']}")
 
             if iteration % 10 == 0:
-                logging.info(f"Overall Performance Summary (Since {start_time.strftime('%Y-%m-%d %H:%M:%S')}): "
-                             f"Start Value: {summary['start_value']:.2f} USDT, Final Value: {summary['final_value']:.2f} USDT, "
-                             f"Total Return: {summary['total_return']:.2f}%, Profit Factor: {summary['profit_factor']:.2f}, "
-                             f"Avg Trade Return: {summary['avg_trade_return']:.2f}%, Trades: {summary['total_trades']}, "
-                             f"Win Rate: {summary['win_rate']:.2f}%, Balance: {summary['current_balance']:.2f} USDT")
-
+                display_results(wallet, markov_chain, dt_analysis)
                 if current_time - last_performance_log >= performance_interval:
                     periodic_performance = wallet.get_periodic_performance()
                     for period, metrics in periodic_performance.items():
-                        logging.info(f"{period} Performance: "
-                                     f"Start Value: {metrics['start_value']:.2f} USDT, Final Value: {metrics['final_value']:.2f} USDT, "
-                                     f"Total Return: {metrics['total_return']:.2f}%, Profit Factor: {metrics['profit_factor']:.2f}, "
-                                     f"Avg Trade Return: {metrics['avg_trade_return']:.2f}%, Trades: {metrics['total_trades']}, "
-                                     f"Win Rate: {metrics['win_rate']:.2f}%, Balance: {metrics['current_balance']:.2f} USDT")
+                        logging.info(f"{period} Performance: Start Value: {metrics['start_value']:.2f} USDT, Final Value: {metrics['final_value']:.2f} USDT, Total Return: {metrics['total_return']:.2f}%")
                     last_performance_log = current_time
 
                 if summary["win_rate"] < 30 and summary["total_trades"] > 10:
