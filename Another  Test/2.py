@@ -5,10 +5,10 @@ import random
 import os
 from datetime import datetime, timedelta
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import recall_score, f1_score, confusion_matrix
+from sklearn.metrics import mean_squared_error
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import joblib
@@ -71,7 +71,7 @@ class Wallet:
         account_info = mt5.account_info()
         self.balance = account_info.balance if account_info else 0
         self.initial_balance = self.balance
-        self.positions = {}  # Now includes trailing stop info
+        self.positions = {}
         self.trade_history = []
         self.max_risk_per_trade = max_risk_per_trade
         self.max_drawdown = max_drawdown
@@ -103,21 +103,46 @@ class Wallet:
             self.positions[pos.ticket] = {
                 'qty': pos.volume, 'entry_price': pos.price_open, 'side': side,
                 'stop_loss': pos.sl, 'take_profit': pos.tp, 'ticket': pos.ticket,
-                'highest_price': pos.price_open, 'lowest_price': pos.price_open,
-                'trailing_stop_percent': random.uniform(1.7, 2.0)  # Default if not set
+                'entry_time': datetime.now()
             }
             logging.info(f"Synced MT5 position: {side} {pos.volume} {symbol} @ {pos.price_open}")
         self.sync_balance()
 
-    def calculate_position_size(self, price, stop_loss_distance):
+    # Modified: Dynamic volume from range [0.01 - 0.10] based on volatility, confidence, and win rate
+    def calculate_position_size(self, price, stop_loss_distance, atr=None, confidence=0.5):
+        volume_range = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10]
         leverage = 15
-        risk_amount = self.balance * self.max_risk_per_trade * leverage
+        summary = self.get_performance_summary()
+        win_rate = summary['win_rate'] / 100  # Convert to decimal
+        
+        # Normalize factors (0 to 1 scale)
+        volatility_factor = min(1.0, atr / (price * 0.02)) if atr else 0.5  # ATR vs 2% of price
+        confidence_factor = min(1.0, confidence)
+        win_rate_factor = min(1.0, win_rate)
+        
+        # Weighted score to select volume index (0 to 9)
+        score = (0.4 * volatility_factor + 0.3 * confidence_factor + 0.3 * win_rate_factor)
+        volume_index = int(score * (len(volume_range) - 1))  # Map to 0-9
+        base_qty = volume_range[volume_index]
+        
+        # Adjust with Kelly-inspired sizing
+        avg_win = max(0.01, summary['avg_trade_return'] / 100)
+        avg_loss = max(0.01, abs(summary['avg_trade_return'] / 100) if summary['avg_trade_return'] < 0 else 0.01)
+        b = avg_win / avg_loss
+        q = 1 - win_rate
+        kelly_fraction = max(0.01, min(0.5, (win_rate * b - q) / b))
+        risk_amount = self.balance * kelly_fraction * leverage
         max_qty = risk_amount / (stop_loss_distance * price)
-        qty = min(max_qty, max_volume)
-        logging.info(f"Position size scaled: Balance={self.balance}, Qty={qty}")
-        return adjust_volume(qty, min_volume, max_volume, volume_step)
+        
+        # Final qty: Constrain between base_qty and max_qty, within volume range
+        qty = min(max(base_qty, min_volume), max_qty, max_volume)
+        qty = adjust_volume(qty, min_volume, max_volume, volume_step)
+        
+        logging.info(f"Volume Factors: Volatility={volatility_factor:.2f}, Confidence={confidence_factor:.2f}, "
+                     f"Win Rate={win_rate_factor:.2f}, Score={score:.2f}, Base Qty={base_qty}, Final Qty={qty}")
+        return qty
 
-    def open_position(self, symbol, side, qty, price, trailing_stop_percent):
+    def open_position(self, symbol, side, qty, price, stop_loss, take_profit):
         if self.paused:
             logging.warning("Trading paused due to drawdown or loss limit.")
             return False
@@ -125,37 +150,17 @@ class Wallet:
         self.sync_balance()
         if self.balance >= cost:
             self.balance -= cost
-            ticket = random.randint(100000, 999999)  # Placeholder, will be updated with MT5 ticket
-            initial_stop_loss = price * (1 - trailing_stop_percent / 100) if side == "Buy" else price * (1 + trailing_stop_percent / 100)
+            ticket = random.randint(100000, 999999)  # Placeholder
             self.positions[ticket] = {
                 'qty': qty, 'entry_price': price, 'side': side,
-                'stop_loss': initial_stop_loss, 'take_profit': None,
-                'ticket': ticket, 'highest_price': price, 'lowest_price': price,
-                'trailing_stop_percent': trailing_stop_percent
+                'stop_loss': stop_loss, 'take_profit': take_profit, 'ticket': ticket,
+                'entry_time': datetime.now()
             }
-            logging.info(f"Opened {side} position: {qty} {symbol} @ {price}, Trailing Stop: {trailing_stop_percent}%")
+            logging.info(f"Opened {side} position: {qty} {symbol} @ {price}, SL: {stop_loss}, TP: {take_profit}")
             return True
         else:
             logging.warning(f"Insufficient funds: {cost} > {self.balance}")
             return False
-
-    def update_trailing_stop(self, ticket, current_price):
-        if ticket not in self.positions:
-            return
-        pos = self.positions[ticket]
-        trailing_stop_percent = pos['trailing_stop_percent']
-        if pos['side'] == "Buy":
-            pos['highest_price'] = max(pos['highest_price'], current_price)
-            new_stop_loss = pos['highest_price'] * (1 - trailing_stop_percent / 100)
-            if new_stop_loss > pos['stop_loss']:
-                pos['stop_loss'] = new_stop_loss
-                logging.info(f"Updated Buy trailing SL for ticket {ticket}: {new_stop_loss}")
-        else:  # Sell
-            pos['lowest_price'] = min(pos['lowest_price'], current_price)
-            new_stop_loss = pos['lowest_price'] * (1 + trailing_stop_percent / 100)
-            if new_stop_loss < pos['stop_loss']:
-                pos['stop_loss'] = new_stop_loss
-                logging.info(f"Updated Sell trailing SL for ticket {ticket}: {new_stop_loss}")
 
     def close_position(self, ticket, price):
         if ticket in self.positions and self.positions[ticket]['qty'] > 0:
@@ -187,18 +192,13 @@ class Wallet:
         if trades is None:
             trades = self.trade_history
         self.sync_balance()
-        total_profit = sum(trade['profit'] for trade in trades if 'profit' in trade)
+        total_profit = sum(trade['profit'] for trade in trades)
         total_trades = len(trades)
         final_value = self.initial_balance + total_profit
         total_return = (final_value - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
-        profit_factor = float('inf') if sum(1 for t in trades if t['profit'] <= 0) == 0 else \
-                        sum(t['profit'] for t in trades if t['profit'] > 0) / abs(sum(t['profit'] for t in trades if t['profit'] <= 0))
-        avg_trade_return = np.mean([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades if total_trades > 0]) if total_trades > 0 else 0
+        profit_factor = float('inf') if sum(1 for t in trades if t['profit'] <= 0) == 0 else sum(t['profit'] for t in trades if t['profit'] > 0) / abs(sum(t['profit'] for t in trades if t['profit'] <= 0))
+        avg_trade_return = np.mean([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades]) if total_trades > 0 else 0
         win_rate = len([t for t in trades if t['profit'] > 0]) / total_trades * 100 if total_trades > 0 else 0
-        current_trade_return = (trades[-1]['profit'] / (trades[-1]['qty'] * trades[-1]['entry_price']) * 100) if trades and total_trades > 0 else 0
-        sharp_ratio = np.mean([t['profit'] / (t['qty'] * t['entry_price']) for t in trades]) / np.std([t['profit'] / (t['qty'] * t['entry_price']) for t in trades]) if total_trades > 1 else 0
-        last_trade_z_score = (current_trade_return - avg_trade_return) / np.std([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in trades]) if total_trades > 1 else 0
-
         return {
             'start_value': self.initial_balance,
             'final_value': final_value,
@@ -207,10 +207,7 @@ class Wallet:
             'avg_trade_return': avg_trade_return,
             'total_trades': total_trades,
             'win_rate': win_rate,
-            'current_balance': self.balance,
-            'current_trade_return': current_trade_return,
-            'sharp_ratio': sharp_ratio,
-            'last_trade_z_score': last_trade_z_score
+            'current_balance': self.balance
         }
 
     def get_periodic_performance(self):
@@ -292,18 +289,6 @@ class MarkovChain:
             self.transition_matrix = np.where(row_sums == 0, 0.5, transitions / row_sums)
             self.stationary_dist = self.compute_stationary_distribution()
             logging.info(f"Updated Markov transition matrix: {self.transition_matrix}")
-
-    def get_markov_analysis(self, trade_history):
-        self.update_transition_matrix(trade_history)
-        current_state, stationary_dist = self.next_state()
-        entropy = self.entropy()
-        markov_win_prob = stationary_dist[1].item() * 100
-        return {
-            'transition_matrix': self.transition_matrix,
-            'stationary_distribution': stationary_dist,
-            'entropy': entropy,
-            'predicted_win_probability': markov_win_prob
-        }
 
 states = ["Loss", "Win"]
 transition_matrix = np.array([[0.6, 0.4], [0.3, 0.7]])
@@ -450,58 +435,37 @@ def adjust_volume(volume, min_vol, max_vol, step):
 def train_models(df):
     if df.empty or not any(col.endswith("_1m") for col in df.columns):
         logging.error("DataFrame is empty or missing required 1m columns")
-        return None, None, None, None
+        return None, None, None
     
     feature_cols = [col for col in df.columns if col not in ["timestamp"] and not col.startswith("turnover")]
     X = df[feature_cols].iloc[:-1]
-    threshold_up = np.percentile((df["close_1m"].pct_change() / df["atr_1m"]).dropna(), 60)
-    threshold_down = np.percentile((df["close_1m"].pct_change() / df["atr_1m"]).dropna(), 40)
-    price_change = (df["close_1m"].shift(-1) - df["close_1m"]) / df["atr_1m"]
-    y = np.where(price_change > threshold_up, 1, np.where(price_change < threshold_down, 0, -1))
-    y = y[:-1]
+    y = df["close_1m"].pct_change().shift(-1).iloc[:-1]  # Predict next price change
+    y = y.fillna(0)  # Handle NaNs
+    
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    mask_train = y_train != -1
-    mask_test = y_test != -1
-    X_train, y_train = X_train[mask_train], y_train[mask_train]
-    X_test, y_test = X_test[mask_test], y_test[mask_test]
-
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf_model = RandomForestRegressor(n_estimators=200, max_depth=10, min_samples_split=5, random_state=42)
     rf_model.fit(X_train_scaled, y_train)
-    rf_accuracy = rf_model.score(X_test_scaled, y_test)
-
-    dt_model = DecisionTreeClassifier(max_depth=5, random_state=42)
+    rf_pred = rf_model.predict(X_test_scaled)
+    rf_mse = mean_squared_error(y_test, rf_pred)
+    
+    dt_model = DecisionTreeRegressor(max_depth=5, min_samples_split=5, random_state=42)
     dt_model.fit(X_train_scaled, y_train)
-    dt_accuracy = dt_model.score(X_test_scaled, y_test)
-    dt_recall = recall_score(y_test, dt_model.predict(X_test_scaled), average='binary')
-    dt_f1 = f1_score(y_test, dt_model.predict(X_test_scaled), average='binary')
-    dt_conf_matrix = confusion_matrix(y_test, dt_model.predict(X_test_scaled))
-    dt_max_depth = dt_model.get_depth()
-    dt_leaves = dt_model.get_n_leaves()
-    dt_feature_importances = dt_model.feature_importances_
-    dt_pred_prob = dt_model.predict_proba(scaler.transform(df[feature_cols].iloc[-1].values.reshape(1, -1)))[0][1] * 100
+    dt_pred = dt_model.predict(X_test_scaled)
+    dt_mse = mean_squared_error(y_test, dt_pred)
 
-    logging.info(f"RF Model Accuracy: {rf_accuracy:.2f}")
-    logging.info(f"DT Model Accuracy: {dt_accuracy:.2f}, Recall: {dt_recall:.2f}, F1: {dt_f1:.2f}")
-    return rf_model, dt_model, scaler, {
-        'accuracy': dt_accuracy,
-        'recall': dt_recall,
-        'f1_score': dt_f1,
-        'confusion_matrix': dt_conf_matrix,
-        'max_depth': dt_max_depth,
-        'leaves': dt_leaves,
-        'feature_importances': dt_feature_importances,
-        'predicted_win_probability': dt_pred_prob
-    }
+    logging.info(f"RF Model MSE: {rf_mse:.6f}")
+    logging.info(f"DT Model MSE: {dt_mse:.6f}")
+    return rf_model, dt_model, scaler
 
 df_initial = fetch_combined_data(symbol, timeframes=["1"], limit=500)
 if df_initial.empty:
     logging.error("Initial data fetch failed. Exiting.")
     exit()
-rf_model, dt_model, scaler, dt_analysis = train_models(df_initial)
+rf_model, dt_model, scaler = train_models(df_initial)
 if rf_model is None or dt_model is None or scaler is None:
     logging.error("Model training failed. Exiting.")
     exit()
@@ -515,44 +479,17 @@ def backtest_strategy(df, initial_balance=50000):
     for i in range(len(df) - 1):
         X_latest = pd.DataFrame(df[feature_cols].iloc[i]).T
         X_latest_scaled = scaler.transform(X_latest)
-        rf_pred = rf_model.predict_proba(X_latest_scaled)[0][1]
-        dt_pred = dt_model.predict_proba(X_latest_scaled)[0][1]
-        prediction = 1 if (rf_pred + dt_pred) / 2 > 0.5 else 0
+        rf_pred = rf_model.predict(X_latest_scaled)[0]
+        dt_pred = dt_model.predict(X_latest_scaled)[0]
+        avg_pred = (rf_pred + dt_pred) / 2
+        prediction = 1 if avg_pred > 0.001 else 0  # Threshold for 0.1% move
         if prediction in [0, 1]:
             execute_trade(prediction, symbol, df.iloc[:i+1], confidence_threshold=0.1)
     summary = wallet.get_performance_summary()
     logging.info(f"Backtest Result: Final Balance={summary['final_value']:.2f}, Return={summary['total_return']:.2f}%")
     return summary
 
-def display_results(wallet, markov_chain, dt_analysis):
-    summary = wallet.get_performance_summary()
-    markov_analysis = markov_chain.get_markov_analysis(wallet.trade_history)
-    
-    print("=== Current Fund Performance (13th Nov 24 - Present) ===")
-    print(f"Start Value: £{summary['start_value']:,}")
-    print(f"Final Value: £{summary['final_value']:,}")
-    print(f"Total Return (Multiplier): {summary['total_return'] / 100:.2f}x")
-    print(f"Profit Factor: {summary['profit_factor']}")
-    print(f"Average Trade Return: {summary['avg_trade_return']:.2f}%")
-    print(f"Return Std Dev: {np.std([t['profit'] / (t['qty'] * t['entry_price']) * 100 for t in wallet.trade_history]):.2f}")
-    print(f"Sharpe Ratio: {summary['sharp_ratio']:.2f}")
-    print(f"Last Trade Z-Score: {summary['last_trade_z_score']:.2f}")
-    print(f"Current Trade Return: {summary['current_trade_return']:.2f}%")
-    print("\n--- Current Fund Markov Chain Analysis ---")
-    print(f"Transition Matrix (Rows: [0=Loss, 1=Win]): {markov_analysis['transition_matrix']}")
-    print(f"Stationary Distribution (Loss, Win): {markov_analysis['stationary_distribution']}")
-    print(f"Markov Chain Entropy: {markov_analysis['entropy']:.2f} bits")
-    print(f"Predicted Next Trade Win Probability (Markov): {markov_analysis['predicted_win_probability']:.2f}%")
-    print("\n--- Current Fund Decision Tree Analysis ---")
-    print(f"Decision Tree Accuracy: {dt_analysis['accuracy']:.2f}")
-    print(f"Decision Tree Recall: {dt_analysis['recall']:.2f}")
-    print(f"Decision Tree F1 Score: {dt_analysis['f1_score']:.2f}")
-    print(f"Decision Tree Confusion Matrix: {dt_analysis['confusion_matrix']}")
-    print(f"Decision Tree Max Depth: {dt_analysis['max_depth']}")
-    print(f"Decision Tree Number of Leaves: {dt_analysis['leaves']}")
-    print(f"Decision Tree Feature Importances: {dt_analysis['feature_importances']}")
-    print(f"Predicted Next Trade Win Probability (Decision Tree): {dt_analysis['predicted_win_probability']:.2f}%")
-
+# Modified: Reduced trade frequency to 30 seconds
 def main_loop():
     iteration = 0
     start_time = datetime.now()
@@ -563,7 +500,7 @@ def main_loop():
     cooldown = 0
     last_close = None
 
-    global rf_model, dt_model, scaler, dt_analysis
+    global rf_model, dt_model, scaler
 
     logging.info("Initial delay of 10 seconds to avoid API rate limits...")
     time.sleep(10)
@@ -579,73 +516,69 @@ def main_loop():
             df = fetch_combined_data(symbol, timeframes=["1"], limit=500)
             if df.empty:
                 logging.warning("No data fetched, skipping iteration.")
-                time.sleep(1)
+                time.sleep(30)  # Changed to 30 seconds
                 continue
 
             current_time = datetime.now()
             current_close = df["close_1m"].iloc[-1]
             if last_close and abs(current_close - last_close) / last_close > 0.02:
-                rf_model, dt_model, scaler, dt_analysis = train_models(df)
+                rf_model, dt_model, scaler = train_models(df)
                 last_retrain_time = current_time
                 logging.info("Models retrained due to significant price move")
             elif current_time - last_retrain_time >= retrain_interval:
-                rf_model, dt_model, scaler, dt_analysis = train_models(df)
+                rf_model, dt_model, scaler = train_models(df)
                 last_retrain_time = current_time
                 logging.info("Models retrained.")
             last_close = current_close
 
             wallet.sync_with_mt5(symbol)
-            current_price = df["close_1m"].iloc[-1]
-
-            # Update trailing stops for all open positions
-            for ticket, pos in list(wallet.positions.items()):
-                wallet.update_trailing_stop(ticket, current_price)
-                new_sl = pos['stop_loss']
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "symbol": symbol,
-                    "position": ticket,
-                    "sl": new_sl,
-                    "tp": pos['take_profit'] if pos['take_profit'] else 0,
-                }
-                result = mt5.order_send(request)
-                if result.retcode != mt5.TRADE_RETCODE_DONE:
-                    logging.error(f"Failed to update SL for ticket {ticket}: {result.comment}")
-                # Check if trailing stop is hit
-                if (pos['side'] == "Buy" and current_price <= new_sl) or (pos['side'] == "Sell" and current_price >= new_sl):
-                    wallet.close_position(ticket, current_price)
-                    logging.info(f"Trailing stop hit for ticket {ticket}")
-
             markov_chain.update_transition_matrix(wallet.trade_history)
             current_state, stationary_dist = markov_chain.next_state()
             entropy = markov_chain.entropy()
             markov_win_prob = stationary_dist[1].item() * 100
             logging.info(f"Current State: {current_state}, Entropy: {entropy:.2f} bits, Markov Win Prob: {markov_win_prob:.2f}%")
-            logging.info("Markov state processed, checking trade conditions...")
+
+            current_price = df["close_1m"].iloc[-1]
+            for ticket, pos in list(wallet.positions.items()):
+                time_open = (current_time - pos['entry_time']).total_seconds() / 60
+                price_change = abs(current_price - pos['entry_price']) / pos['entry_price']
+                if time_open > 5 and price_change < 0.005:
+                    wallet.close_position(ticket, current_price)
+                    logging.info(f"Closed {pos['side']} position due to timeout: Ticket={ticket}")
 
             feature_cols = [col for col in df.columns if col not in ["timestamp"] and not col.startswith("turnover")]
             X_latest = pd.DataFrame(df[feature_cols].iloc[-1]).T
             X_latest_scaled = scaler.transform(X_latest)
-            rf_prediction = rf_model.predict_proba(X_latest_scaled)[0][1]
-            dt_prediction = dt_model.predict_proba(X_latest_scaled)[0][1]
-            avg_confidence = (rf_prediction + dt_prediction) / 2
-            prediction = 1 if avg_confidence > 0.5 else 0
-            logging.info(f"Prediction: {prediction} (RF: {rf_prediction:.2f}, DT: {dt_prediction:.2f}, Avg: {avg_confidence:.2f})")
+            rf_pred = rf_model.predict(X_latest_scaled)[0]
+            dt_pred = dt_model.predict(X_latest_scaled)[0]
+            avg_pred = (rf_pred + dt_pred) / 2
+            prediction = 1 if avg_pred > 0.001 else 0
+            logging.info(f"Prediction: {prediction} (RF: {rf_pred:.6f}, DT: {dt_pred:.6f}, Avg: {avg_pred:.6f})")
+            
             if prediction in [0, 1]:
                 execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_prob=markov_win_prob)
-                cooldown = 2
+                cooldown = 30  # Changed to 30 seconds
 
             iteration += 1
             logging.info(f"Iteration {iteration} completed, preparing performance summary...")
             summary = wallet.get_performance_summary()
-            logging.info(f"Temporary Summary: Balance: {summary['current_balance']:.2f}, Trades: {summary['total_trades']}")
+            logging.info(f"Temporary Summary: Balance: {summary['current_balance']:.2f}, Trades: {summary['total_trades']}, Profit Factor: {summary['profit_factor']:.2f}")
 
             if iteration % 10 == 0:
-                display_results(wallet, markov_chain, dt_analysis)
+                logging.info(f"Overall Performance Summary (Since {start_time.strftime('%Y-%m-%d %H:%M:%S')}): "
+                             f"Start Value: {summary['start_value']:.2f} USDT, Final Value: {summary['final_value']:.2f} USDT, "
+                             f"Total Return: {summary['total_return']:.2f}%, Profit Factor: {summary['profit_factor']:.2f}, "
+                             f"Avg Trade Return: {summary['avg_trade_return']:.2f}%, Trades: {summary['total_trades']}, "
+                             f"Win Rate: {summary['win_rate']:.2f}%, Balance: {summary['current_balance']:.2f} USDT")
+
                 if current_time - last_performance_log >= performance_interval:
                     periodic_performance = wallet.get_periodic_performance()
                     for period, metrics in periodic_performance.items():
-                        logging.info(f"{period} Performance: Start Value: {metrics['start_value']:.2f} USDT, Final Value: {metrics['final_value']:.2f} USDT, Total Return: {metrics['total_return']:.2f}%")
+                        logging.info(f"{period} Performance: "
+                                     f"Start Value: {metrics['start_value']:.2f} USDT, Final Value: {metrics['final_value']:.2f} USDT, "
+                                     f"Total Return: {metrics['total_return']:.2f}%, Profit Factor: {metrics['profit_factor']:.2f}, "
+                                     f"Avg Trade Return: {metrics['avg_trade_return']:.2f}%, Trades: {metrics['total_trades']}, "
+                                     f"Win Rate: {metrics['win_rate']:.2f}%, Balance: {metrics['current_balance']:.2f} USDT")
                     last_performance_log = current_time
 
                 if summary["win_rate"] < 30 and summary["total_trades"] > 10:
@@ -655,12 +588,13 @@ def main_loop():
                     wallet.max_risk_per_trade = min(0.5, wallet.max_risk_per_trade * 1.2)
                     logging.info(f"Increased risk to {wallet.max_risk_per_trade*100}% due to high win rate.")
 
-            logging.info("Sleeping for 1 second before next iteration...")
-            time.sleep(1)
+            logging.info("Sleeping for 30 seconds before next iteration...")
+            time.sleep(30)  # Changed to 30 seconds
         except Exception as e:
             logging.error(f"Unexpected error in main loop: {e}")
-            time.sleep(1)
+            time.sleep(30)  # Changed to 30 seconds
 
+# Modified: Pass ATR and confidence to calculate_position_size
 def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_prob=0.0):
     side = "Buy" if prediction == 1 else "Sell"
     try:
@@ -668,76 +602,57 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
         current_price = (min(ask_prices) + max(bid_prices)) / 2
         if current_price == 100.05:
             current_price = df["close_1m"].iloc[-1]
-            logging.warning(f"Using fallback current price: {current_price} from DataFrame")
+            logging.warning(f"Using fallback current price: {current_price}")
 
         feature_cols = [col for col in df.columns if col not in ["timestamp"] and not col.startswith("turnover")]
         X_latest = pd.DataFrame(df[feature_cols].iloc[-1]).T
         X_latest_scaled = scaler.transform(X_latest)
-        rf_confidence = rf_model.predict_proba(X_latest_scaled)[0][1] if prediction == 1 else 1 - rf_model.predict_proba(X_latest_scaled)[0][1]
-        dt_confidence = dt_model.predict_proba(X_latest_scaled)[0][1] if prediction == 1 else 1 - dt_model.predict_proba(X_latest_scaled)[0][1]
-        if rf_confidence < confidence_threshold or dt_confidence < confidence_threshold:
-            logging.info(f"Confidence too low: RF={rf_confidence:.2f}, DT={dt_confidence:.2f}")
+        rf_pred = rf_model.predict(X_latest_scaled)[0]
+        dt_pred = dt_model.predict(X_latest_scaled)[0]
+        avg_pred = (rf_pred + dt_pred) / 2
+        confidence = abs(avg_pred) / 0.01
+        
+        summary = wallet.get_performance_summary()
+        dynamic_threshold = max(confidence_threshold, 0.5 - summary['win_rate'] / 200)
+        if confidence < dynamic_threshold:
+            logging.info(f"Confidence too low: {confidence:.2f}, Threshold={dynamic_threshold:.2f}")
             return
 
-        # Set trailing stop between 1.7% and 2%
-        trailing_stop_percent = random.uniform(1.7, 2.0)
-        initial_stop_loss = current_price * (1 - trailing_stop_percent / 100) if side == "Buy" else current_price * (1 + trailing_stop_percent / 100)
-        take_profit_distance = min(max(df["atr_1m"].iloc[-1] * 10, min_stop_level * tick_size * 2), current_price * 0.05)
-        take_profit = round(current_price + take_profit_distance if side == "Buy" else current_price - take_profit_distance, 6)
-
-        hurst_value = hurst_exponent(df["close_1m"].values[-50:])
-        if (side == "Buy" and hurst_value > 0.6) or (side == "Sell" and hurst_value < 0.4):
-            logging.warning(f"Unfavorable trend for {side}: Hurst={hurst_value}")
+        atr_1m = df["atr_1m"].iloc[-1]
+        volatility = atr_1m / df["close_1m"].iloc[-1]
+        if volatility < 0.01:
+            logging.info(f"Volatility too low: {volatility*100:.2f}%")
             return
 
         close_1m = df["close_1m"].iloc[-1]
         ma20_1m = df["ma20_1m"].iloc[-1]
-        momentum_1m = df["momentum_1m"].iloc[-1]
-        momentum_threshold = df["atr_1m"].iloc[-1] * 0.1
-        if side == "Buy" and close_1m > ma20_1m and momentum_1m >= -momentum_threshold:
-            logging.info("Breakout Buy signal confirmed")
-        elif side == "Sell" and close_1m < ma20_1m and momentum_1m <= momentum_threshold:
-            logging.info("Breakout Sell signal confirmed")
-        else:
-            logging.info(f"No breakout signal for {side}: close={close_1m}, ma20={ma20_1m}, momentum={momentum_1m}")
-            return
-
+        ma50_1m = df["ma50_1m"].iloc[-1]
         rsi = df["rsi_1m"].iloc[-1]
-        if side == "Buy" and rsi > 70:
-            logging.warning(f"Buy rejected: RSI overbought {rsi}")
-            return
-        elif side == "Sell" and rsi < 30:
-            logging.warning(f"Sell rejected: RSI oversold {rsi}")
-            return
+        momentum_1m = df["momentum_1m"].iloc[-1]
 
-        volatility = df["atr_1m"].iloc[-1] / df["close_1m"].iloc[-1]
-        if volatility < 0.005:
-            logging.info(f"Volatility too low: {volatility*100:.2f}%")
+        if side == "Buy" and (close_1m <= ma20_1m or ma20_1m <= ma50_1m or rsi > 65 or momentum_1m < 0):
+            logging.info(f"Buy rejected: Close={close_1m}, MA20={ma20_1m}, MA50={ma50_1m}, RSI={rsi}, Momentum={momentum_1m}")
+            return
+        elif side == "Sell" and (close_1m >= ma20_1m or ma20_1m >= ma50_1m or rsi < 35 or momentum_1m > 0):
+            logging.info(f"Sell rejected: Close={close_1m}, MA20={ma20_1m}, MA50={ma50_1m}, RSI={rsi}, Momentum={momentum_1m}")
             return
 
-        # Determine position size based on win probability
-        stop_loss_distance = current_price * trailing_stop_percent / 100
-        dt_win_prob = dt_confidence * 100  # Convert to percentage
-        high_prob_threshold = 70  # Define "high" as >70% win probability
-        if dt_win_prob >= high_prob_threshold:
-            adjusted_qty = random.uniform(0.15, 0.2)  # 0.15 to 0.2 BTC for high probability
-            adjusted_qty = adjust_volume(adjusted_qty, min_volume, max_volume, volume_step)
-            logging.info(f"High win probability ({dt_win_prob:.2f}%) detected: Setting qty to {adjusted_qty} BTC")
-        else:
-            adjusted_qty = wallet.calculate_position_size(current_price, stop_loss_distance)
-            logging.info(f"Standard win probability ({dt_win_prob:.2f}%): Calculated qty = {adjusted_qty}")
+        confidence_factor = min(confidence, 1.0)
+        stop_loss_distance = atr_1m * (0.5 + (1 - confidence_factor))
+        take_profit_distance = atr_1m * (5 + confidence_factor * 5)
+        stop_loss = round(current_price - stop_loss_distance if side == "Buy" else current_price + stop_loss_distance, 6)
+        take_profit = round(current_price + take_profit_distance if side == "Buy" else current_price - take_profit_distance, 6)
 
-        if adjusted_qty < min_volume * 10:
-            adjusted_qty = min_volume * 10
-            logging.info(f"Forced minimum qty: {adjusted_qty}")
+        sl_distance = abs(current_price - stop_loss)
+        min_distance = min_stop_level * tick_size
+        if sl_distance < min_distance:
+            stop_loss = current_price - min_distance if side == "Buy" else current_price + min_distance
+            logging.warning(f"Adjusted SL to minimum distance: {stop_loss}")
+
+        # Pass ATR and confidence to calculate_position_size
+        adjusted_qty = wallet.calculate_position_size(current_price, stop_loss_distance, atr=atr_1m, confidence=confidence)
         if adjusted_qty < min_volume:
             logging.warning(f"Trade qty {adjusted_qty} below minimum {min_volume}. Skipping.")
-            return
-
-        cost = adjusted_qty * current_price
-        wallet.sync_balance()
-        if cost > wallet.balance:
-            logging.warning(f"Trade cost {cost:.2f} USDT exceeds balance {wallet.balance:.2f} USDT. Skipping.")
             return
 
         if side == "Sell":
@@ -756,7 +671,7 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             "volume": adjusted_qty,
             "type": order_type,
             "price": current_price,
-            "sl": initial_stop_loss,
+            "sl": stop_loss,
             "tp": take_profit,
             "deviation": 20,
             "magic": 123456,
@@ -765,27 +680,18 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.1, markov_win_p
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        logging.info(f"Attempting {side} trade: Price={current_price}, Qty={adjusted_qty}, Initial SL={initial_stop_loss}, TP={take_profit}")
+        logging.info(f"Attempting {side} trade: Price={current_price}, Qty={adjusted_qty}, SL={stop_loss}, TP={take_profit}")
         result = mt5.order_send(request)
-        logging.info(f"MT5 Order Result: {result}")
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logging.error(f"Order failed: {result.comment} (retcode: {result.retcode})")
             return
 
-        # Update wallet with actual MT5 ticket
-        ticket = result.order
-        if wallet.positions:  # If there’s a placeholder, replace it
-            wallet.positions[ticket] = wallet.positions.pop(next(iter(wallet.positions)))
-        else:
-            wallet.positions[ticket] = {}
-        wallet.positions[ticket] = {
-            'qty': adjusted_qty, 'entry_price': current_price, 'side': side,
-            'stop_loss': initial_stop_loss, 'take_profit': take_profit,
-            'ticket': ticket, 'highest_price': current_price, 'lowest_price': current_price,
-            'trailing_stop_percent': trailing_stop_percent
-        }
-
-        logging.info(f"Placed {side} order with {trailing_stop_percent}% trailing stop: {adjusted_qty} {symbol} @ {current_price}")
+        wallet.sync_with_mt5(symbol)
+        if side == "Buy":
+            wallet.open_position(symbol, side, adjusted_qty, current_price, stop_loss, take_profit)
+        elif side == "Sell" and len(wallet.positions) > 0:
+            for ticket in list(wallet.positions.keys()):
+                wallet.close_position(ticket, current_price)
 
     except Exception as e:
         logging.error(f"Error executing trade: {e}")
