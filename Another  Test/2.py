@@ -71,17 +71,43 @@ class Wallet:
         self.max_drawdown = max_drawdown
         self.paused = False
         self.max_profit = {}
+        # Recommendation 2: Add manual override attributes
+        self.manual_override = False
+        self.manual_override_time = None
 
     def sync_balance(self):
         account_info = mt5.account_info()
         if account_info is not None:
             self.balance = account_info.balance
             drawdown = (self.initial_balance - self.balance) / self.initial_balance
+            # Recommendation 1: Enforce 10% drawdown pause
             if drawdown >= self.max_drawdown:
                 self.paused = True
                 logging.warning(f"Max drawdown ({self.max_drawdown*100}%) reached. Trading paused.")
+            # Recommendation 1: Hard stop-loss at 95% of initial balance
+            if self.balance < self.initial_balance * 0.95:
+                self.close_all_positions()
+                self.paused = True
+                logging.warning("Equity below 95% of initial balance. All positions closed and trading paused.")
         else:
             logging.warning("Failed to sync balance with MT5")
+        # Recommendation 2: Detect manual closure
+        mt5_positions = mt5.positions_get(symbol=symbol)
+        current_tickets = {pos.ticket for pos in mt5_positions} if mt5_positions else set()
+        wallet_tickets = {mt5.order_check({'ticket': pos['ticket']}).order for pos in self.positions.values() if 'ticket' in pos}
+        if wallet_tickets and not current_tickets:  # All positions closed manually
+            self.manual_override = True
+            self.manual_override_time = datetime.now()
+            self.paused = True
+            self.positions = {}
+            logging.info("Manual closure detected. Pausing trading for 1 hour.")
+        elif mt5_positions:  # Sync positions with MT5
+            self.positions = {symbol: {'ticket': pos.ticket, 'qty': pos.volume, 'entry_price': pos.price_open, 
+                                      'side': "Buy" if pos.type == mt5.ORDER_TYPE_BUY else "Sell", 
+                                      'open_time': datetime.fromtimestamp(pos.time), 
+                                      'entry_imbalance': pos.get('entry_imbalance', 0), 
+                                      'entry_volume_spike': pos.get('entry_volume_spike', 0)}
+                              for pos in mt5_positions if pos.symbol == symbol}
 
     def calculate_position_size(self, price, risk_distance, fixed_qty=None, volume_multiplier=1.0):
         if fixed_qty is not None:
@@ -92,7 +118,7 @@ class Wallet:
 
     def open_position(self, symbol, side, qty, price, df, stop_loss=None, take_profit=None):
         if self.paused:
-            logging.warning("Trading paused due to drawdown limit.")
+            logging.warning("Trading paused due to drawdown or manual override.")
             return False
         cost = qty * price
         self.sync_balance()
@@ -139,6 +165,11 @@ class Wallet:
             del self.positions[symbol]
             del self.max_profit[symbol]
             self.sync_balance()
+
+    def close_all_positions(self):
+        for sym in list(self.positions.keys()):
+            current_price = mt5.symbol_info_tick(sym).bid if self.positions[sym]['side'] == "Buy" else mt5.symbol_info_tick(sym).ask
+            self.close_position(sym, current_price)
 
     def get_performance_summary(self, trades=None):
         if trades is None:
@@ -255,20 +286,17 @@ def is_trend_reversal(df, short_period=10, long_period=30, timeframe="5m"):
     return bullish_cross, bearish_cross
 
 def calculate_support_resistance(df, window=20, timeframe="5m"):
-    """Identify support and resistance levels based on pivot points."""
     df = df.copy()
     df["pivot_high"] = df[f"high_{timeframe}"].rolling(window=window, center=True).max()
     df["pivot_low"] = df[f"low_{timeframe}"].rolling(window=window, center=True).min()
     
-    # Resistance: frequent highs where price reverses
     resistance_levels = df[df[f"high_{timeframe}"] == df["pivot_high"]][f"high_{timeframe}"].value_counts()
-    resistance_levels = resistance_levels[resistance_levels >= 2].index.tolist()  # At least 2 touches
-    resistance_levels = sorted(resistance_levels, reverse=True)[:3]  # Top 3 resistance levels
+    resistance_levels = resistance_levels[resistance_levels >= 2].index.tolist()
+    resistance_levels = sorted(resistance_levels, reverse=True)[:3]
     
-    # Support: frequent lows where price reverses
     support_levels = df[df[f"low_{timeframe}"] == df["pivot_low"]][f"low_{timeframe}"].value_counts()
-    support_levels = support_levels[support_levels >= 2].index.tolist()  # At least 2 touches
-    support_levels = sorted(support_levels)[:3]  # Top 3 support levels
+    support_levels = support_levels[support_levels >= 2].index.tolist()
+    support_levels = sorted(support_levels)[:3]
     
     return support_levels, resistance_levels
 
@@ -382,7 +410,7 @@ if rf_model is None or dt_model is None or scaler is None:
     logging.error("Model training failed. Exiting.")
     exit()
 
-def execute_trade(prediction, symbol, df, confidence_threshold=0.60, markov_win_prob=0.0):
+def execute_trade(prediction, symbol, df, confidence_threshold=0.70, markov_win_prob=0.0):  # Recommendation 3: Increased to 0.70
     if wallet.paused:
         logging.warning("Trading paused.")
         return
@@ -403,6 +431,12 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.60, markov_win_
         X_latest_scaled = scaler.transform(X_latest)
         rf_confidence = rf_model.predict_proba(X_latest_scaled)[0][1] if prediction == 1 else 1 - rf_model.predict_proba(X_latest_scaled)[0][1]
         dt_confidence = dt_model.predict_proba(X_latest_scaled)[0][1] if prediction == 1 else 1 - dt_model.predict_proba(X_latest_scaled)[0][1]
+        
+        # Recommendation 3: Require both RF and DT to agree
+        if (prediction == 1 and (rf_confidence < confidence_threshold or dt_confidence < confidence_threshold)) or \
+           (prediction == 0 and ((1 - rf_confidence) < confidence_threshold or (1 - dt_confidence) < confidence_threshold)):
+            logging.debug(f"Models disagree or below threshold: RF={rf_confidence:.2f}, DT={dt_confidence:.2f}")
+            return
         
         imbalance = calculate_bid_ask_imbalance(bid_volumes, ask_volumes)
         big_move_factor = 1.0
@@ -448,6 +482,9 @@ def execute_trade(prediction, symbol, df, confidence_threshold=0.60, markov_win_
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             logging.error(f"Order failed: {result.comment} (retcode: {result.retcode})")
             return
+        else:
+            # Store ticket in position data
+            wallet.positions[symbol]['ticket'] = result.order
 
         logging.info(f"Placed {side} order: {adjusted_qty} {symbol} @ {current_price}, Imbalance: {imbalance:.2f}, Volume Spike: {volume_spike_1m}")
         wallet.open_position(symbol, side, adjusted_qty, current_price, df)
@@ -462,13 +499,23 @@ def main_loop():
     last_retrain = datetime.now()
     retrain_interval = timedelta(hours=1)
     confidence_adjustment = 0.0
+    atr_threshold = None  # Recommendation 4: For volatility filter
 
     while True:
         try:
             df = fetch_combined_data(symbol, timeframes=["1", "3", "5"], limit=200)
             if df.empty:
                 logging.warning("No data fetched, skipping iteration.")
-                time.sleep(5)
+                time.sleep(15)  # Recommendation 3: Increased to 15 seconds
+                continue
+
+            # Recommendation 4: Calculate ATR threshold (2x 14-period mean)
+            if atr_threshold is None or iteration % 10 == 0:  # Recalculate periodically
+                atr_mean = df["atr_5m"].rolling(window=14).mean().iloc[-1]
+                atr_threshold = atr_mean * 2
+            if df["atr_5m"].iloc[-1] > atr_threshold:
+                logging.info(f"ATR {df['atr_5m'].iloc[-1]:.2f} exceeds threshold {atr_threshold:.2f}. Pausing iteration.")
+                time.sleep(15)
                 continue
 
             logging.debug(f"Iteration {iteration} - Data columns: {df.columns.tolist()}")
@@ -476,6 +523,17 @@ def main_loop():
             if datetime.now() - last_retrain >= retrain_interval:
                 rf_model, dt_model, scaler = train_models(df)
                 last_retrain = datetime.now()
+
+            # Recommendation 2: Check manual override pause
+            if wallet.paused and wallet.manual_override:
+                if (datetime.now() - wallet.manual_override_time) >= timedelta(hours=1):
+                    wallet.paused = False
+                    wallet.manual_override = False
+                    logging.info("Resuming trading after 1-hour manual override pause.")
+                else:
+                    logging.info("Trading paused due to manual override.")
+                    time.sleep(15)
+                    continue
 
             current_state, stationary_dist = markov_chain.next_state()
             markov_win_prob = stationary_dist[1] * 100
@@ -493,7 +551,7 @@ def main_loop():
                 execute_trade(prediction, symbol, df, confidence_threshold=0.50, markov_win_prob=markov_win_prob)
             elif current_state == "Win" and markov_win_prob >= 40:
                 prediction = 1 if rf_pred > 0.30 or dt_pred > 0.30 else 0
-                adjusted_threshold = max(0.50, 0.60 + confidence_adjustment)
+                adjusted_threshold = max(0.50, 0.70 + confidence_adjustment)  # Recommendation 3: Base threshold to 0.70
                 logging.info(f"Iteration {iteration} - RF Win Prob: {rf_pred*100:.2f}%, DT Win Prob: {dt_pred*100:.2f}%, Prediction: {prediction}, Adjusted Threshold: {adjusted_threshold}")
                 execute_trade(prediction, symbol, df, confidence_threshold=adjusted_threshold, markov_win_prob=markov_win_prob)
             else:
@@ -534,9 +592,11 @@ def main_loop():
                 wallet.max_profit[sym] = max(wallet.max_profit[sym], profit_percent)
                 trailing_stop = wallet.max_profit[sym] - 1.0
 
-                # Support/Resistance Exit Logic
-                near_resistance = any(abs(current_price - r) / current_price < 0.005 for r in resistance_levels)  # Within 0.5%
-                near_support = any(abs(current_price - s) / current_price < 0.005 for s in support_levels)       # Within 0.5%
+                near_resistance = any(abs(current_price - r) / current_price < 0.005 for r in resistance_levels)
+                near_support = any(abs(current_price - s) / current_price < 0.005 for s in support_levels)
+                
+                # Recommendation 4: Adjust profit target for Buy to 1.5%
+                profit_target = 1.5 if side == "Buy" else dynamic_profit_target
                 
                 if side == "Buy" and near_resistance and (imbalance < -0.2 or profit_percent > 0):
                     logging.info(f"Iteration {iteration} - Near resistance {resistance_levels}, Imbalance: {imbalance:.2f}, closing Buy with profit: {profit_percent:.2f}%")
@@ -544,9 +604,8 @@ def main_loop():
                 elif side == "Sell" and near_support and (imbalance > 0.2 or profit_percent > 0):
                     logging.info(f"Iteration {iteration} - Near support {support_levels}, Imbalance: {imbalance:.2f}, closing Sell with profit: {profit_percent:.2f}%")
                     wallet.close_position(sym, current_price)
-                # Existing Profit-Taking Logic
-                elif profit_percent >= dynamic_profit_target:
-                    logging.info(f"Iteration {iteration} - Dynamic profit target hit: {profit_percent:.2f}% (Target: {dynamic_profit_target:.2f}%)")
+                elif profit_percent >= profit_target:
+                    logging.info(f"Iteration {iteration} - Profit target hit: {profit_percent:.2f}% (Target: {profit_target:.2f}%)")
                     wallet.close_position(sym, current_price)
                 elif profit_percent >= 1.5 and rf_model.predict_proba(X_latest_scaled)[0][1 if side == "Buy" else 0] < 0.5:
                     logging.info(f"Iteration {iteration} - Profit secured due to reversal signal: {profit_percent:.2f}%")
@@ -586,10 +645,10 @@ def main_loop():
                              f"Final Value: {summary['final_value']:.2f}, Total Return: {summary['total_return']:.2f}%, "
                              f"Trades: {summary['total_trades']}, Win Rate: {summary['win_rate']:.2f}%")
 
-            time.sleep(5)
+            time.sleep(15)  # Recommendation 3: Increased to 15 seconds
         except Exception as e:
             logging.error(f"Iteration {iteration} - Unexpected error in main loop: {e}")
-            time.sleep(5)
+            time.sleep(15)
 
 if __name__ == "__main__":
     main_loop()
